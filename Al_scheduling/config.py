@@ -9,6 +9,10 @@ N_JOBS = 15
 N_MACHINES = 10
 MAX_OPS_PER_JOB = 10 # 작업당 최대 공정 수
 
+# N_JOBS = 2
+# N_MACHINES = 2
+# MAX_OPS_PER_JOB = 10 # 작업당 최대 공정 수
+
 # 에이전트 1 (SAC) 하이퍼파라미터
 GAT_N_HEADS = 4
 GAT_OUT_DIM = 8

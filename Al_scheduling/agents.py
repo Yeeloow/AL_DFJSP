@@ -6,7 +6,9 @@ import torch.nn.functional as F
 from networks import Actor, Critic, DuelingD5QN
 from config import *
 import numpy as np
-from torch_geometric.data import Batch
+# --- 이 부분이 수정되었습니다 ---
+# torch_geometric.data에서 Data와 Batch 클래스를 import 합니다.
+from torch_geometric.data import Data, Batch
 from torch_geometric.utils import to_dense_batch
 
 class Agent1_SAC:
@@ -29,6 +31,9 @@ class Agent1_SAC:
 
     def select_action(self, state, deterministic=False):
         with torch.no_grad():
+            if not isinstance(state, (Data, Batch)):
+                raise TypeError(f"Expected Data or Batch object, but got {type(state)}")
+
             state_batch = state if isinstance(state, Batch) else Batch.from_data_list([state])
             state_batch = state_batch.to(DEVICE)
             
@@ -43,9 +48,11 @@ class Agent1_SAC:
                 mask = torch.ones(dense_scores.size(1), device=DEVICE, dtype=torch.bool)
                 if len(eligible_ops) > 0:
                     mask_indices = torch.tensor(eligible_ops, device=DEVICE)
-                    if mask_indices.max() < mask.size(0):
+                    if mask_indices.numel() > 0 and mask_indices.max() < mask.size(0):
                          mask[mask_indices] = False
                 dense_scores[i, mask] = -float('inf')
+            
+            dense_scores = torch.nan_to_num(dense_scores, neginf=-1e9)
             
             probs = F.softmax(dense_scores, dim=1)
             probs = probs + 1e-8
@@ -59,6 +66,7 @@ class Agent1_SAC:
 
         if not isinstance(state, Batch) or state_batch.num_graphs == 1:
             return action.item(), log_prob.item(), entropy.item()
+        
         return action, log_prob, entropy
 
     def update(self, replay_buffer, batch_size):
@@ -113,76 +121,66 @@ class Agent1_SAC:
 
 class Agent2_D5QN:
     def __init__(self, machine_feature_dim, op_machine_pair_dim, **kwargs):
-        self.q_network = DuelingD5QN(machine_feature_dim, op_machine_pair_dim, **kwargs).to(DEVICE)
-        self.target_network = DuelingD5QN(machine_feature_dim, op_machine_pair_dim, **kwargs).to(DEVICE)
+        # 네트워크 입력 차원은 이전과 동일 (기본 7개 + 통계 2개)
+        self.q_network = DuelingD5QN(machine_feature_dim + 2, op_machine_pair_dim, **kwargs).to(DEVICE)
+        self.target_network = DuelingD5QN(machine_feature_dim + 2, op_machine_pair_dim, **kwargs).to(DEVICE)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=D5QN_LR)
         self.update_counter = 0
 
     def _calculate_statistical_features(self, state, op_action_idx):
-        """선택된 공정에 대해, 각 기계별로 통계적 특징을 계산합니다."""
-        earliest_times = []
-        num_slots = []
-        
+        earliest_times = []; num_slots = []
         op_proc_times = state.om_features[op_action_idx]
-        prev_op_comp_time = state.eligible_ops_details.get(op_action_idx, 0)
+        prev_op_comp_time = state.eligible_ops_details[op_action_idx].item()
         
         for machine_idx in range(N_MACHINES):
             proc_time = op_proc_times[machine_idx][0].item()
             if proc_time == 0:
-                earliest_times.append(float('inf'))
-                num_slots.append(0)
+                earliest_times.append(float('inf')); num_slots.append(0)
                 continue
-            
-            op_history = state.op_histories[machine_idx]
+                
+            busy_intervals = state.op_histories[machine_idx] # op_histories는 이제 busy_intervals
             current_check_time = prev_op_comp_time
+            available_slots_count = 0; earliest_fit_time = float('inf')
             
-            available_slots_count = 0
-            earliest_fit_time = float('inf')
-            
-            # Case A: 기계가 비어있을 때
-            if not op_history:
+            if not busy_intervals:
                 earliest_fit_time = current_check_time
-                available_slots_count = 1 # 무한대의 슬롯
+                available_slots_count = 1
             else:
-                # Case B: 첫 작업 시작 전
-                if op_history[0][1] - 0 >= proc_time:
+                # 첫 작업 시작 전
+                if busy_intervals[0][0] - 0 >= proc_time:
                     start = max(0, current_check_time)
-                    if start + proc_time <= op_history[0][1]:
+                    if start + proc_time <= busy_intervals[0][0]:
                         earliest_fit_time = min(earliest_fit_time, start)
                         available_slots_count += 1
 
-                # Case C: 작업들 사이
-                for i in range(len(op_history) - 1):
-                    idle_start, idle_end = op_history[i][2], op_history[i+1][1]
+                # 작업들 사이
+                for i in range(len(busy_intervals) - 1):
+                    idle_start, idle_end = busy_intervals[i][1], busy_intervals[i+1][0]
                     if idle_end - idle_start >= proc_time:
                         start = max(idle_start, current_check_time)
                         if start + proc_time <= idle_end:
                             earliest_fit_time = min(earliest_fit_time, start)
                             available_slots_count += 1
                 
-                # Case D: 마지막 작업 이후
-                last_op_end = op_history[-1][2]
+                # 마지막 작업 이후
+                last_op_end = busy_intervals[-1][1]
                 start = max(last_op_end, current_check_time)
                 earliest_fit_time = min(earliest_fit_time, start)
                 available_slots_count += 1
 
-            earliest_times.append(earliest_fit_time)
-            num_slots.append(available_slots_count)
-            
+            earliest_times.append(earliest_fit_time); num_slots.append(available_slots_count)
         return torch.tensor([earliest_times, num_slots], dtype=torch.float, device=DEVICE).t()
+
 
 
     def select_action(self, state, selected_op_idx):
         with torch.no_grad():
             self.q_network.eval()
-            
             stat_features = self._calculate_statistical_features(state, selected_op_idx)
             combined_m_features = torch.cat([state.m_features, stat_features], dim=-1).unsqueeze(0)
-            
             op_machine_pairs = state.om_features[selected_op_idx].unsqueeze(0)
             q_values = self.q_network(combined_m_features, op_machine_pairs).squeeze(0)
-            
             mask = (state.om_features[selected_op_idx].sum(axis=1) == 0)
             q_values[mask] = -float('inf')
             action = q_values.argmax().item()
@@ -203,24 +201,16 @@ class Agent2_D5QN:
         done_batch = torch.tensor(dones, dtype=torch.float, device=DEVICE).unsqueeze(1)
         is_weights_batch = is_weights.unsqueeze(1).to(DEVICE)
 
-        # --- 이 부분이 수정되었습니다: update에서도 통계적 특징 계산 ---
-        # 1. 현재 상태(s_t)에 대한 통계적 특징 계산
-        #    - 각 상태(s)와 그 때의 행동(a[0])을 짝지어 계산
         stat_features_list = [self._calculate_statistical_features(s, a[0]) for s, a in zip(states, actions)]
         stat_features_batch = torch.stack(stat_features_list)
-        #    - 기존 기계 특징과 결합하여 최종 입력 생성
         combined_m_features = torch.cat([state_batch.m_features.view(batch_size, N_MACHINES, -1), stat_features_batch], dim=-1)
 
-        # 2. 다음 상태(s_{t+1})에 대한 통계적 특징 계산
-        #    - 다음 상태에서 선택 가능한 첫 번째 행동을 기준으로 계산
         next_op_indices_local = torch.tensor([s.eligible_ops[0] if len(s.eligible_ops) > 0 else 0 for s in next_states], device=DEVICE)
         next_stat_features_list = [self._calculate_statistical_features(ns, op_idx.item()) for ns, op_idx in zip(next_states, next_op_indices_local)]
         next_stat_features_batch = torch.stack(next_stat_features_list)
-        #    - 기존 다음 상태 기계 특징과 결합
         next_combined_m_features = torch.cat([next_state_batch.m_features.view(batch_size, N_MACHINES, -1), next_stat_features_batch], dim=-1)
         
         op_indices_global = state_batch.ptr[:-1] + op_indices_local
-        # om_features_dim 계산 시, 네트워크 입력 차원이 아닌 원래 특징 차원을 사용해야 합니다.
         om_features_dim = 2 
         om_pairs_selected = state_batch.om_features[op_indices_global].view(batch_size, N_MACHINES, om_features_dim)
 
@@ -229,7 +219,6 @@ class Agent2_D5QN:
 
         with torch.no_grad():
             self.q_network.eval(); self.target_network.eval()
-            # 결합된 특징(combined_m_features)을 네트워크에 전달
             next_q_values_current_net = self.q_network(next_combined_m_features, next_om_pairs_selected)
             best_next_actions = next_q_values_current_net.argmax(dim=1, keepdim=True)
             next_q_values_target_net = self.target_network(next_combined_m_features, next_om_pairs_selected)
@@ -238,7 +227,6 @@ class Agent2_D5QN:
         
         y = reward_batch + (1 - done_batch) * D5QN_GAMMA * target_q_next
         
-        # 결합된 특징(combined_m_features)을 네트워크에 전달
         current_q_values = self.q_network(combined_m_features, om_pairs_selected)
         current_q = current_q_values.gather(1, action_batch)
         td_errors = (y - current_q).abs()
