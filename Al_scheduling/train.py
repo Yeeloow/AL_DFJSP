@@ -81,7 +81,33 @@ def main():
         if t % 5000 == 0 and t > 0:
             avg_val_makespan = validate(agent1, agent2, validation_instances, max_ops_in_dataset)
             avg_train_makespan = np.mean(episode_makespans) if episode_makespans else 0
-            # ... (이하 로깅 및 모델 저장 로직) ...
+            # 1. 평균 손실 및 Q-가치 계산
+            avg_sac_losses = {k: np.mean([d[k] for d in log_data['sac']]) for k in log_data['sac'][0]} if log_data['sac'] else {}
+            avg_d5qn_losses = {k: np.mean([d[k] for d in log_data['d5qn']]) for k in log_data['d5qn'][0]} if log_data['d5qn'] else {}
+
+            # 2. 텐서보드에 로그 기록
+            writer.add_scalar('Makespan/Train', avg_train_makespan, t)
+            writer.add_scalar('Makespan/Validation', avg_val_makespan, t)
+            for k, v in avg_sac_losses.items():
+                writer.add_scalar(f'SAC/{k}', v, t)
+            for k, v in avg_d5qn_losses.items():
+                writer.add_scalar(f'D5QN/{k}', v, t)
+
+            # 3. 콘솔에 진행 상황 출력
+            print(f"\n[Step {t}] Train Makespan: {avg_train_makespan:.2f} | Validation Makespan: {avg_val_makespan:.2f}")
+            print(f"  SAC Losses: {avg_sac_losses}")
+            print(f"  D5QN Losses: {avg_d5qn_losses}")
+
+            # 4. 최고의 모델 저장
+            if avg_val_makespan < best_val_makespan:
+                best_val_makespan = avg_val_makespan
+                torch.save(agent1.actor.state_dict(), 'best_actor_model.pth')
+                torch.save(agent2.q_network.state_dict(), 'best_q_network_model.pth')
+                print(f"*** 새로운 최고 성능 모델 저장! (Validation Makespan: {best_val_makespan:.2f}) ***")
+
+            # 5. 다음 로깅을 위해 로그 데이터 초기화
+            log_data = {'sac': [], 'd5qn': []}
+            episode_makespans = []
             
     writer.close()
 
