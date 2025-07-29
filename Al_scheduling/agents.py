@@ -71,8 +71,9 @@ class Agent1_SAC:
 
     def update(self, replay_buffer, batch_size):
         sampled_data = replay_buffer.sample(batch_size)
-        if sampled_data is None or sampled_data[0] is None: return None
-        states, actions, rewards, next_states, dones, _, _ = sampled_data
+        if sampled_data is None:  # sample()이 None을 반환하면 학습을 건너뜀
+            return None
+        states, actions, rewards, next_states, dones, idxs, is_weights = sampled_data
 
         state_batch = Batch.from_data_list(states).to(DEVICE)
         next_state_batch = Batch.from_data_list(next_states).to(DEVICE)
@@ -189,7 +190,8 @@ class Agent2_D5QN:
         
     def update(self, replay_buffer, batch_size):
         sampled_data = replay_buffer.sample(batch_size)
-        if sampled_data is None or sampled_data[0] is None: return None
+        if sampled_data is None:  # sample()이 None을 반환하면 학습을 건너뜀
+            return None
         states, actions, rewards, next_states, dones, idxs, is_weights = sampled_data
 
         state_batch = Batch.from_data_list(states).to(DEVICE)
