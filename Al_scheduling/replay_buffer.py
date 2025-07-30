@@ -84,7 +84,8 @@ class PrioritizedReplayBuffer:
                 priorities.append(p)
                 batch.append(data)
                 idxs.append(idx)
-        
+        if not batch:
+            return None  # 유효한 배치가 없으면 None을 반환
         sampling_probabilities = np.array(priorities) / self.tree.total()
         # 중요도 샘플링(IS) 가중치 계산
         is_weights = np.power(self.tree.n_entries * sampling_probabilities, -self.beta)

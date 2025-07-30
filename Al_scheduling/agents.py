@@ -179,8 +179,8 @@ class Agent2_D5QN:
         with torch.no_grad():
             self.q_network.eval()
             stat_features = self._calculate_statistical_features(state, selected_op_idx)
-            combined_m_features = torch.cat([state.m_features, stat_features], dim=-1).unsqueeze(0)
-            op_machine_pairs = state.om_features[selected_op_idx].unsqueeze(0)
+            combined_m_features = torch.cat([state.m_features.to(DEVICE), stat_features], dim=-1).unsqueeze(0)
+            op_machine_pairs = state.om_features[selected_op_idx].unsqueeze(0).to(DEVICE)
             q_values = self.q_network(combined_m_features, op_machine_pairs).squeeze(0)
             mask = (state.om_features[selected_op_idx].sum(axis=1) == 0)
             q_values[mask] = -float('inf')

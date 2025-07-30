@@ -98,8 +98,6 @@ class FJSPEnv:
 
     def _get_state(self):
         op_features_list = []
-        # eligible_ops_details = self._get_eligible_ops_details()
-        # eligible_ops_indices = list(eligible_ops_details.keys())
         raw_details = self._get_eligible_ops_details()
         eligible_ops_indices = list(raw_details.keys())
         detail_list = [raw_details.get(i, 0) for i in range(self.total_ops)]
@@ -176,7 +174,8 @@ class FJSPEnv:
             if any(m.busy_intervals for m in self.machines):
                 self.current_time = min(m.available_time for m in self.machines if m.busy_intervals)
         new_makespan = self._calculate_makespan()
-        reward = prev_makespan - new_makespan
+        # 보상의 정규화 (이번에 배정한 공정의 시간 대비 makespan의 증가 비율)
+        reward = (prev_makespan - new_makespan) / processing_time
         done = all(op.is_scheduled for job in self.jobs for op in job.ops)
         return self._get_state(), reward, done
 
