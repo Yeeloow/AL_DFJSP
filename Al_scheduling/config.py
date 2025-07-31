@@ -7,7 +7,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # FJSP 환경 설정
 N_JOBS = 15
 N_MACHINES = 10
-MAX_OPS_PER_JOB = 10 # 작업당 최대 공정 수
+MAX_OPS_PER_JOB = 3 # 작업당 최대 공정 수
 
 # N_JOBS = 2
 # N_MACHINES = 2

@@ -13,6 +13,92 @@ import warnings
 import csv
 import os
 from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+def plot_gantt_chart(schedule_data, n_jobs, n_machines, filename):
+    """
+    주어진 스케줄 데이터로 간트 차트를 그리고 파일로 저장하는 함수
+    """
+    fig, ax = plt.subplots(figsize=(20, 10))
+    
+    # 각 Job에 대한 고유한 색상 설정
+    colors = plt.cm.get_cmap('tab20', n_jobs)
+
+    for m_id, tasks in schedule_data.items():
+        for task in tasks:
+            job_id, op_id, start, end = task
+            duration = end - start
+            
+            # 사전 점유 스케줄은 회색으로, 에이전트가 스케줄한 작업은 Job 색상으로 표시
+            color = colors(job_id % 20) if job_id != -1 else 'gray'
+            
+            # 막대그래프 추가 (시작시간, 기간)
+            ax.broken_barh([(start, duration)], (m_id * 10, 9), facecolors=color, edgecolor='black')
+            
+            # 막대 안에 텍스트 추가
+            text = f'J{job_id}-O{op_id}' if job_id != -1 else 'Pre'
+            ax.text(start + duration / 2, m_id * 10 + 4.5, text, ha='center', va='center', color='white', fontweight='bold')
+
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Machines')
+    ax.set_title('Gantt Chart for Validation Instance')
+    ax.set_yticks([i * 10 + 4.5 for i in range(n_machines)])
+    ax.set_yticklabels([f'Machine {i}' for i in range(n_machines)])
+    ax.grid(True, axis='x', linestyle=':')
+    
+    # 범례(Legend) 추가
+    legend_elements = [Patch(facecolor=colors(i % 20), label=f'Job {i}') for i in range(n_jobs)]
+    legend_elements.append(Patch(facecolor='gray', label='Pre-occupied'))
+    ax.legend(handles=legend_elements, bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close(fig)  # 메모리 누수를 방지하기 위해 그림 닫기
+    print(f"간트 차트가 '{filename}' 파일로 저장되었습니다.")
+def plot_eligibility_table(jobs, filename):
+    """
+    Job/Operation별로 할당 가능한 기계 목록을 테이블 형태의 이미지로 저장하는 함수
+    """
+    row_labels = []
+    cell_text = []
+    
+    # 테이블에 들어갈 데이터 준비
+    for job in jobs:
+        for op in job.ops:
+            row_labels.append(f'Job {job.id} - Op {op.id}')
+            # 기계 ID 리스트를 문자열로 변환 (예: [1, 2, 5] -> "1, 2, 5")
+            machines_str = ', '.join(map(str, op.eligible_machines))
+            cell_text.append([machines_str])
+
+    if not cell_text:
+        print("[Table Plot] No data to plot for eligibility table.")
+        return
+
+    # 테이블 크기 동적 조절
+    fig_height = max(4, len(row_labels) * 0.4)
+    fig, ax = plt.subplots(figsize=(6, fig_height))
+    ax.axis('tight')
+    ax.axis('off')
+
+    # 테이블 생성
+    table = ax.table(
+        cellText=cell_text,
+        rowLabels=row_labels,
+        colLabels=['Eligible Machines'],
+        loc='center',
+        cellLoc='center'
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+
+    ax.set_title('Job-Machine Eligibility Table', fontweight="bold", y=0.9)
+    fig.tight_layout()
+    
+    plt.savefig(filename, bbox_inches='tight')
+    plt.close(fig)
+    print(f"장비 할당 테이블이 '{filename}' 파일로 저장되었습니다.")
 
 VALIDATION_LOG_FILE = 'validation_log.csv'
 
@@ -34,7 +120,7 @@ def generate_pre_occupied_schedule(n_machines):
             last_end_time = 0
 
             for _ in range(num_intervals):
-                # 이전 스케줄이 끝난 후, 0~10의 랜덤한 간격을 둠
+                # 이전 스케줄이 끝난 후, 50의 랜덤한 간격을 둠
                 gap = np.random.randint(0, 51)
                 start_time = last_end_time + gap
 
@@ -51,28 +137,70 @@ def generate_pre_occupied_schedule(n_machines):
             
     return schedule
 
-def validate(agent1, agent2, validation_instances, max_ops):
+def validate(agent1, agent2, validation_instances, max_ops, current_step):
     total_makespan = 0
+    validation_results = []
+
     agent1.actor.eval()
     agent2.q_network.eval()
     with torch.no_grad():
-        for instance_data_list in validation_instances:
+        for i, instance_data_list in enumerate(validation_instances):
             env = FJSPEnv()
             env.instance_jobs_data = instance_data_list
             
-            # --- 이 부분이 수정되었습니다 ---
-            # 검증 시마다 랜덤한 사전 점유 스케줄 생성
             pre_occupied_schedule = generate_pre_occupied_schedule(env.n_machines)
             state_dict = env.reset(initial_schedule=pre_occupied_schedule)
-            # --- 여기까지 수정 ---
             
+            step_in_episode = 0
             done = False
             while not done:
                 state_data = Data(**state_dict)
                 op_action, _, _ = agent1.select_action(state_data, deterministic=True)
                 machine_action = agent2.select_action(state_data, op_action)
-                state_dict, _, done = env.step((op_action, machine_action))
+                state_dict, _, done = env.step((op_action, machine_action), is_validation=True)
+                step_in_episode += 1
+            
             total_makespan += env._calculate_makespan()
+            
+            schedule_data_for_plot = {}
+            for m in env.machines:
+                for op_info, interval in zip(m.processed_op_sequence, m.busy_intervals):
+                    job_id, op_id = op_info
+                    start, end = interval
+                    if m.id not in schedule_data_for_plot:
+                        schedule_data_for_plot[m.id] = []
+                    schedule_data_for_plot[m.id].append((job_id, op_id, start, end))
+            
+            validation_results.append({
+                'steps': step_in_episode,
+                'schedule_data': schedule_data_for_plot,
+                'n_jobs': env.n_jobs,
+                'n_machines': env.n_machines,
+                'jobs': env.jobs  # --- 이 부분을 추가하여 Job 데이터 저장 ---
+            })
+
+    if validation_results:
+        longest_instance = max(validation_results, key=lambda x: x['steps'])
+        
+        print("\n" + "="*50)
+        print(f"[Gantt Chart & Table] Plotting longest instance from validation at step {current_step}.")
+        print(f"  -> Instance ran for {longest_instance['steps']} steps.")
+        print("="*50 + "\n")
+        
+        # 간트 차트 생성
+        gantt_filename = f'validation_gantt_step_{current_step}_longest.png'
+        plot_gantt_chart(
+            longest_instance['schedule_data'],
+            longest_instance['n_jobs'],
+            longest_instance['n_machines'],
+            gantt_filename
+        )
+        
+        # --- 테이블 생성 함수 호출 추가 ---
+        table_filename = f'validation_eligibility_table_step_{current_step}.png'
+        plot_eligibility_table(longest_instance['jobs'], table_filename)
+        # --- 여기까지 추가 ---
+
     agent1.actor.train()
     agent2.q_network.train()
     return total_makespan / len(validation_instances)
@@ -133,8 +261,8 @@ def main():
             if sac_loss_dict: log_data['sac'].append(sac_loss_dict)
             if d5qn_loss_dict: log_data['d5qn'].append(d5qn_loss_dict)
 
-        if t % 30 == 0 and t > 0:
-            avg_val_makespan = validate(agent1, agent2, validation_instances, max_ops_in_dataset)
+        if t % 100 == 0 and t > 0:
+            avg_val_makespan = validate(agent1, agent2, validation_instances, max_ops_in_dataset, t)
             avg_train_makespan = np.mean(episode_makespans) if episode_makespans else 0
             
             with open(VALIDATION_LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
