@@ -92,7 +92,7 @@ class DuelingD5QN(nn.Module):
         # --- 이 부분이 수정되었습니다 ---
         # 기계 특징 입력 차원이 2만큼 증가 (earliest_fit_time, num_available_slots)
         # self.machine_feature_proj = nn.Linear(machine_feature_dim + 2, hidden_size)
-        self.machine_feature_proj = nn.Linear(9, hidden_size) #<-- 디버깅을 위해 입력 차원을 9로 강제
+        self.machine_feature_proj = nn.Linear(5, hidden_size)
 
         self.advantage = nn.Sequential(NoisyLinear(hidden_size + op_machine_pair_dim, 128), nn.ReLU(), NoisyLinear(128, 1))
         self.value = nn.Sequential(NoisyLinear(hidden_size + op_machine_pair_dim, 128), nn.ReLU(), NoisyLinear(128, 1))

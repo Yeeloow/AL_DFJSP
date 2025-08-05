@@ -129,60 +129,27 @@ class Agent2_D5QN:
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=D5QN_LR)
         self.update_counter = 0
 
-    def _calculate_statistical_features(self, state, op_action_idx):
-        earliest_times = []; num_slots = []
-        op_proc_times = state.om_features[op_action_idx]
-        prev_op_comp_time = state.eligible_ops_details[op_action_idx].item()
-        
-        for machine_idx in range(N_MACHINES):
-            proc_time = op_proc_times[machine_idx][0].item()
-            if proc_time == 0:
-                earliest_times.append(float('inf')); num_slots.append(0)
-                continue
-                
-            busy_intervals = state.op_histories[machine_idx] # op_histories는 이제 busy_intervals
-            current_check_time = prev_op_comp_time
-            available_slots_count = 0; earliest_fit_time = float('inf')
-            
-            if not busy_intervals:
-                earliest_fit_time = current_check_time
-                available_slots_count = 1
-            else:
-                # 첫 작업 시작 전
-                if busy_intervals[0][0] - 0 >= proc_time:
-                    start = max(0, current_check_time)
-                    if start + proc_time <= busy_intervals[0][0]:
-                        earliest_fit_time = min(earliest_fit_time, start)
-                        available_slots_count += 1
-
-                # 작업들 사이
-                for i in range(len(busy_intervals) - 1):
-                    idle_start, idle_end = busy_intervals[i][1], busy_intervals[i+1][0]
-                    if idle_end - idle_start >= proc_time:
-                        start = max(idle_start, current_check_time)
-                        if start + proc_time <= idle_end:
-                            earliest_fit_time = min(earliest_fit_time, start)
-                            available_slots_count += 1
-                
-                # 마지막 작업 이후
-                last_op_end = busy_intervals[-1][1]
-                start = max(last_op_end, current_check_time)
-                earliest_fit_time = min(earliest_fit_time, start)
-                available_slots_count += 1
-
-            earliest_times.append(earliest_fit_time); num_slots.append(available_slots_count)
-        return torch.tensor([earliest_times, num_slots], dtype=torch.float, device=DEVICE).t()
-
-
-
-    def select_action(self, state, selected_op_idx):
+    def select_action(self, state, selected_op_idx, log_q_values=False):
         with torch.no_grad():
             self.q_network.eval()
-            stat_features = self._calculate_statistical_features(state, selected_op_idx)
-            combined_m_features = torch.cat([state.m_features.to(DEVICE), stat_features], dim=-1).unsqueeze(0)
+            combined_m_features = state.m_features.to(DEVICE).unsqueeze(0)
             op_machine_pairs = state.om_features[selected_op_idx].unsqueeze(0).to(DEVICE)
+            
             q_values = self.q_network(combined_m_features, op_machine_pairs).squeeze(0)
+
+            # 마스킹 로직을 먼저 수행
             mask = (state.om_features[selected_op_idx].sum(axis=1) == 0)
+
+            # --- 에이전트 결정 로그 수정 ---
+            if log_q_values:
+                # 자격이 있는 기계들의 인덱스를 찾음
+                eligible_machines = np.where(mask.cpu().numpy() == False)[0]
+                
+                print(f"--- Q-Values for Op index: {selected_op_idx} ---")
+                print(f"Eligible Machines: {eligible_machines}") # 자격 목록 함께 출력
+                print(np.round(q_values.detach().cpu().numpy(), 2))
+            # --- 수정 끝 ---
+
             q_values[mask] = -float('inf')
             action = q_values.argmax().item()
             self.q_network.train()
@@ -190,7 +157,7 @@ class Agent2_D5QN:
         
     def update(self, replay_buffer, batch_size):
         sampled_data = replay_buffer.sample(batch_size)
-        if sampled_data is None:  # sample()이 None을 반환하면 학습을 건너뜀
+        if sampled_data is None:
             return None
         states, actions, rewards, next_states, dones, idxs, is_weights = sampled_data
 
@@ -203,33 +170,33 @@ class Agent2_D5QN:
         done_batch = torch.tensor(dones, dtype=torch.float, device=DEVICE).unsqueeze(1)
         is_weights_batch = is_weights.unsqueeze(1).to(DEVICE)
 
-        stat_features_list = [self._calculate_statistical_features(s, a[0]) for s, a in zip(states, actions)]
-        stat_features_batch = torch.stack(stat_features_list)
-        combined_m_features = torch.cat([state_batch.m_features.view(batch_size, N_MACHINES, -1), stat_features_batch], dim=-1)
+        # --- 이 부분이 수정되었습니다 (대폭 단순화) ---
+        # state_batch에서 m_features를 바로 사용합니다.
+        machine_features = state_batch.m_features.view(batch_size, N_MACHINES, -1)
+        next_machine_features = next_state_batch.m_features.view(batch_size, N_MACHINES, -1)
 
-        next_op_indices_local = torch.tensor([s.eligible_ops[0] if len(s.eligible_ops) > 0 else 0 for s in next_states], device=DEVICE)
-        next_stat_features_list = [self._calculate_statistical_features(ns, op_idx.item()) for ns, op_idx in zip(next_states, next_op_indices_local)]
-        next_stat_features_batch = torch.stack(next_stat_features_list)
-        next_combined_m_features = torch.cat([next_state_batch.m_features.view(batch_size, N_MACHINES, -1), next_stat_features_batch], dim=-1)
-        
         op_indices_global = state_batch.ptr[:-1] + op_indices_local
         om_features_dim = 2 
         om_pairs_selected = state_batch.om_features[op_indices_global].view(batch_size, N_MACHINES, om_features_dim)
 
+        # 다음 상태에서 가장 가능성 높은 op 선택 (기존 로직 유지)
+        next_op_indices_local = torch.tensor([s.eligible_ops[0] if len(s.eligible_ops) > 0 else 0 for s in next_states], device=DEVICE)
         next_op_indices_global = next_state_batch.ptr[:-1] + next_op_indices_local
         next_om_pairs_selected = next_state_batch.om_features[next_op_indices_global].view(batch_size, N_MACHINES, om_features_dim)
 
         with torch.no_grad():
             self.q_network.eval(); self.target_network.eval()
-            next_q_values_current_net = self.q_network(next_combined_m_features, next_om_pairs_selected)
+            # 다음 상태의 Q-value 계산 시 next_machine_features 사용
+            next_q_values_current_net = self.q_network(next_machine_features, next_om_pairs_selected)
             best_next_actions = next_q_values_current_net.argmax(dim=1, keepdim=True)
-            next_q_values_target_net = self.target_network(next_combined_m_features, next_om_pairs_selected)
+            next_q_values_target_net = self.target_network(next_machine_features, next_om_pairs_selected)
             target_q_next = next_q_values_target_net.gather(1, best_next_actions)
             self.q_network.train(); self.target_network.train()
         
         y = reward_batch + (1 - done_batch) * D5QN_GAMMA * target_q_next
         
-        current_q_values = self.q_network(combined_m_features, om_pairs_selected)
+        # 현재 상태의 Q-value 계산 시 machine_features 사용
+        current_q_values = self.q_network(machine_features, om_pairs_selected)
         current_q = current_q_values.gather(1, action_batch)
         td_errors = (y - current_q).abs()
         

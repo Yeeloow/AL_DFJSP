@@ -5,8 +5,8 @@ import torch
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # FJSP 환경 설정
-N_JOBS = 15
-N_MACHINES = 10
+N_JOBS = 5
+N_MACHINES = 7
 MAX_OPS_PER_JOB = 3 # 작업당 최대 공정 수
 
 # N_JOBS = 2
@@ -25,7 +25,7 @@ SAC_DECAY_RATIO = 0.9
 TRANSFORMER_N_HEADS = 4
 TRANSFORMER_N_LAYERS = 2
 TRANSFORMER_HIDDEN_SIZE = 32
-D5QN_LR = 3e-4
+D5QN_LR = 3e-3
 D5QN_EPSILON = 0.8
 D5QN_GAMMA = 1.0
 
