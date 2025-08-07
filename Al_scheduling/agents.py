@@ -6,10 +6,12 @@ import torch.nn.functional as F
 from networks import Actor, Critic, DuelingD5QN
 from config import *
 import numpy as np
-# --- 이 부분이 수정되었습니다 ---
-# torch_geometric.data에서 Data와 Batch 클래스를 import 합니다.
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import to_dense_batch
+import logging # [추가됨] logging 모듈 임포트
+
+# [추가됨] fjsp_environment.py에서 설정한 것과 동일한 이름으로 로거를 가져옵니다.
+validation_logger = logging.getLogger('validation_logger')
 
 class Agent1_SAC:
     def __init__(self, op_feature_dim, max_ops, gat_dim=GAT_OUT_DIM, n_heads=GAT_N_HEADS):
@@ -71,12 +73,28 @@ class Agent1_SAC:
 
     def update(self, replay_buffer, batch_size):
         sampled_data = replay_buffer.sample(batch_size)
-        if sampled_data is None:  # sample()이 None을 반환하면 학습을 건너뜀
+        if sampled_data is None:
             return None
         states, actions, rewards, next_states, dones, idxs, is_weights = sampled_data
 
-        state_batch = Batch.from_data_list(states).to(DEVICE)
-        next_state_batch = Batch.from_data_list(next_states).to(DEVICE)
+        # --- ▼▼▼ 수정된 부분 ▼▼▼ ---
+        # Agent1이 처리할 수 없는 복잡한 객체를 Data에서 제거하는 클렌징 과정
+        keys_to_remove = ['jobs', 'op_map_rev', 'op_histories', 'travel_times']
+        
+        clean_states = []
+        for s in states:
+            clean_s_dict = {k: v for k, v in s.to_dict().items() if k not in keys_to_remove}
+            clean_states.append(Data(**clean_s_dict))
+
+        clean_next_states = []
+        for s in next_states:
+            clean_s_dict = {k: v for k, v in s.to_dict().items() if k not in keys_to_remove}
+            clean_next_states.append(Data(**clean_s_dict))
+            
+        # 정제된 데이터를 사용하여 배치 생성
+        state_batch = Batch.from_data_list(clean_states).to(DEVICE)
+        next_state_batch = Batch.from_data_list(clean_next_states).to(DEVICE)
+        # --- ▲▲▲ 수정 끝 ▲▲▲ ---
         
         op_actions = torch.tensor([a[0] for a in actions], device=DEVICE)
         action_batch_one_hot = F.one_hot(op_actions, num_classes=self.max_ops).float()
@@ -121,34 +139,117 @@ class Agent1_SAC:
         }
 
 class Agent2_D5QN:
+    # --- ▼▼▼ 수정된 부분 ▼▼▼ ---
+    # __init__ 메서드가 인자를 명시적으로 받도록 수정하여 중복 문제를 해결합니다.
     def __init__(self, machine_feature_dim, op_machine_pair_dim, **kwargs):
-        # 네트워크 입력 차원은 이전과 동일 (기본 7개 + 통계 2개)
-        self.q_network = DuelingD5QN(machine_feature_dim + 2, op_machine_pair_dim, **kwargs).to(DEVICE)
-        self.target_network = DuelingD5QN(machine_feature_dim + 2, op_machine_pair_dim, **kwargs).to(DEVICE)
+        # 이제 train.py에서 전달된 machine_feature_dim 값을 사용합니다.
+        self.q_network = DuelingD5QN(
+            machine_feature_dim=machine_feature_dim, 
+            op_machine_pair_dim=op_machine_pair_dim, 
+            **kwargs
+        ).to(DEVICE)
+        self.target_network = DuelingD5QN(
+            machine_feature_dim=machine_feature_dim, 
+            op_machine_pair_dim=op_machine_pair_dim, 
+            **kwargs
+        ).to(DEVICE)
+    # --- ▲▲▲ 수정 끝 ▲▲▲ ---
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=D5QN_LR)
         self.update_counter = 0
 
-    def select_action(self, state, selected_op_idx, log_q_values=False):
+    # --- ▼▼▼ 이 아래의 다른 메서드들은 변경 없습니다 ▼▼▼ ---
+    def _find_first_fit_for_machine(self, busy_intervals, ready_time, proc_time):
+        """ Agent 내부에서 대기 시간을 계산하기 위해 환경의 함수를 재현 """
+        if not busy_intervals:
+            return ready_time
+        if ready_time + proc_time <= busy_intervals[0][0]:
+            return ready_time
+        for i in range(len(busy_intervals) - 1):
+            idle_start = busy_intervals[i][1]
+            idle_end = busy_intervals[i+1][0]
+            potential_start = max(idle_start, ready_time)
+            if potential_start + proc_time <= idle_end:
+                return potential_start
+        last_available_time = busy_intervals[-1][1] if busy_intervals else 0
+        return max(last_available_time, ready_time)
+
+    def _calculate_features_for_one_item(self, state, selected_op_idx):
+        """ 단일 state 객체에 대해 새로운 5차원 머신 피쳐를 계산 """
+        # ... (이하 _calculate_features_for_one_item 메서드 내용은 이전과 동일)
+        jobs = state.jobs
+        op_map_rev = state.op_map_rev
+        job_id, op_id = op_map_rev[selected_op_idx]
+        op = jobs[job_id].ops[op_id]
+        
+        predecessor_op = jobs[job_id].ops[op.id - 1] if op.id > 0 else None
+
+        all_workloads = state.m_features[:, 0]
+        avg_workload = torch.mean(all_workloads) if len(all_workloads) > 0 else 0.0
+
+        wait_times = []
+        for machine_idx in range(N_MACHINES):
+            final_ready_time = 0.0
+            if predecessor_op and predecessor_op.is_scheduled:
+                travel_time = state.travel_times[predecessor_op.scheduled_machine][machine_idx].item()
+                final_ready_time = predecessor_op.completion_time + travel_time
+            
+            processing_time = op.machine_map.get(machine_idx, float('inf'))
+            if processing_time != float('inf'):
+                busy_intervals = state.op_histories[machine_idx]
+                actual_start_time = self._find_first_fit_for_machine(busy_intervals, final_ready_time, processing_time)
+                wait_time = actual_start_time - final_ready_time
+            else:
+                wait_time = float('inf')
+            wait_times.append(wait_time)
+
+        valid_wait_times = [t for t in wait_times if t != float('inf')]
+        max_wait_time = max(valid_wait_times) if valid_wait_times else 1.0
+        max_workload = torch.max(all_workloads).item() if len(all_workloads) > 0 else 1.0
+        max_proc_time = max(op.processing_times) if op.processing_times else 1.0
+        
+        new_features_list = []
+        for machine_idx in range(N_MACHINES):
+            workload = state.m_features[machine_idx, 0].item()
+            num_candidates = state.m_features[machine_idx, 1].item()
+            processing_time = op.machine_map.get(machine_idx, 0)
+
+            wait_time_norm = wait_times[machine_idx] / (max_wait_time + 1e-8) if wait_times[machine_idx] != float('inf') else 1.0
+            workload_norm = workload / (max_workload + 1e-8)
+            workload_vs_avg_norm = (workload - avg_workload) / (max_workload + 1e-8)
+            proc_time_norm = processing_time / (max_proc_time + 1e-8)
+            num_candidates_norm = num_candidates / N_MACHINES
+            
+            new_features_list.append([
+                wait_time_norm, workload_norm, workload_vs_avg_norm,
+                proc_time_norm, num_candidates_norm
+            ])
+        
+        return torch.tensor(new_features_list, dtype=torch.float, device=DEVICE)
+
+
+    def select_action(self, state, selected_op_idx, log_q_values=False, current_step=None):
+    # --- ▲▲▲ 수정 끝 ▲▲▲ ---
         with torch.no_grad():
             self.q_network.eval()
-            combined_m_features = state.m_features.to(DEVICE).unsqueeze(0)
+            new_m_features = self._calculate_features_for_one_item(state, selected_op_idx).unsqueeze(0)
             op_machine_pairs = state.om_features[selected_op_idx].unsqueeze(0).to(DEVICE)
-            
-            q_values = self.q_network(combined_m_features, op_machine_pairs).squeeze(0)
+            q_values = self.q_network(new_m_features, op_machine_pairs).squeeze(0)
 
-            # 마스킹 로직을 먼저 수행
             mask = (state.om_features[selected_op_idx].sum(axis=1) == 0)
 
-            # --- 에이전트 결정 로그 수정 ---
             if log_q_values:
-                # 자격이 있는 기계들의 인덱스를 찾음
                 eligible_machines = np.where(mask.cpu().numpy() == False)[0]
+                q_values_str = np.round(q_values.detach().cpu().numpy(), 2)
                 
-                print(f"--- Q-Values for Op index: {selected_op_idx} ---")
-                print(f"Eligible Machines: {eligible_machines}") # 자격 목록 함께 출력
-                print(np.round(q_values.detach().cpu().numpy(), 2))
-            # --- 수정 끝 ---
+                # --- ▼▼▼ 수정된 부분 (로그 메시지 형식 변경) ▼▼▼ ---
+                log_message = (
+                    f"[Step {current_step}] Q-Values for Op index: {selected_op_idx}\n"
+                    f"  - Eligible Machines: {eligible_machines}\n"
+                    f"  - Q-Values: {q_values_str}"
+                )
+                validation_logger.info(log_message)
+                # --- ▲▲▲ 수정 끝 ▲▲▲ ---
 
             q_values[mask] = -float('inf')
             action = q_values.argmax().item()
@@ -160,43 +261,45 @@ class Agent2_D5QN:
         if sampled_data is None:
             return None
         states, actions, rewards, next_states, dones, idxs, is_weights = sampled_data
-
-        state_batch = Batch.from_data_list(states).to(DEVICE)
-        next_state_batch = Batch.from_data_list(next_states).to(DEVICE)
         
-        op_indices_local = torch.tensor([a[0] for a in actions], device=DEVICE)
+        op_indices = torch.tensor([a[0] for a in actions], device=DEVICE)
         action_batch = torch.tensor([a[1] for a in actions], dtype=torch.long, device=DEVICE).unsqueeze(1)
         reward_batch = torch.tensor(rewards, dtype=torch.float, device=DEVICE).unsqueeze(1)
         done_batch = torch.tensor(dones, dtype=torch.float, device=DEVICE).unsqueeze(1)
-        is_weights_batch = is_weights.unsqueeze(1).to(DEVICE)
+        is_weights_batch = torch.tensor(is_weights, dtype=torch.float, device=DEVICE).unsqueeze(1)
 
-        # --- 이 부분이 수정되었습니다 (대폭 단순화) ---
-        # state_batch에서 m_features를 바로 사용합니다.
-        machine_features = state_batch.m_features.view(batch_size, N_MACHINES, -1)
-        next_machine_features = next_state_batch.m_features.view(batch_size, N_MACHINES, -1)
+        # 배치 내 각 항목에 대해 실시간으로 특징 계산
+        current_m_features_batch = []
+        for i in range(batch_size):
+            features = self._calculate_features_for_one_item(states[i], op_indices[i].item())
+            current_m_features_batch.append(features)
+        current_m_features_tensor = torch.stack(current_m_features_batch)
 
-        op_indices_global = state_batch.ptr[:-1] + op_indices_local
-        om_features_dim = 2 
-        om_pairs_selected = state_batch.om_features[op_indices_global].view(batch_size, N_MACHINES, om_features_dim)
+        next_m_features_batch = []
+        next_op_indices = torch.tensor([s.eligible_ops[0] if len(s.eligible_ops) > 0 else 0 for s in next_states], device=DEVICE)
+        for i in range(batch_size):
+            features = self._calculate_features_for_one_item(next_states[i], next_op_indices[i].item())
+            next_m_features_batch.append(features)
+        next_m_features_tensor = torch.stack(next_m_features_batch)
 
-        # 다음 상태에서 가장 가능성 높은 op 선택 (기존 로직 유지)
-        next_op_indices_local = torch.tensor([s.eligible_ops[0] if len(s.eligible_ops) > 0 else 0 for s in next_states], device=DEVICE)
-        next_op_indices_global = next_state_batch.ptr[:-1] + next_op_indices_local
-        next_om_pairs_selected = next_state_batch.om_features[next_op_indices_global].view(batch_size, N_MACHINES, om_features_dim)
+        # om_features 또한 배치에 맞게 재구성
+        om_pairs_list = [states[i].om_features[op_indices[i]] for i in range(batch_size)]
+        om_pairs_tensor = torch.stack(om_pairs_list).to(DEVICE)
+
+        next_om_pairs_list = [next_states[i].om_features[next_op_indices[i]] for i in range(batch_size)]
+        next_om_pairs_tensor = torch.stack(next_om_pairs_list).to(DEVICE)
 
         with torch.no_grad():
             self.q_network.eval(); self.target_network.eval()
-            # 다음 상태의 Q-value 계산 시 next_machine_features 사용
-            next_q_values_current_net = self.q_network(next_machine_features, next_om_pairs_selected)
+            next_q_values_current_net = self.q_network(next_m_features_tensor, next_om_pairs_tensor)
             best_next_actions = next_q_values_current_net.argmax(dim=1, keepdim=True)
-            next_q_values_target_net = self.target_network(next_machine_features, next_om_pairs_selected)
+            next_q_values_target_net = self.target_network(next_m_features_tensor, next_om_pairs_tensor)
             target_q_next = next_q_values_target_net.gather(1, best_next_actions)
             self.q_network.train(); self.target_network.train()
         
         y = reward_batch + (1 - done_batch) * D5QN_GAMMA * target_q_next
         
-        # 현재 상태의 Q-value 계산 시 machine_features 사용
-        current_q_values = self.q_network(machine_features, om_pairs_selected)
+        current_q_values = self.q_network(current_m_features_tensor, om_pairs_tensor)
         current_q = current_q_values.gather(1, action_batch)
         td_errors = (y - current_q).abs()
         

@@ -15,7 +15,22 @@ import os
 from datetime import datetime
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+import logging
 
+def setup_loss_logger():
+    # 'loss_logger' 라는 고유한 이름으로 로거를 생성
+    logger = logging.getLogger('loss_logger')
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+
+    # 핸들러가 이미 설정되어 있는지 확인하여 중복 방지
+    if not logger.handlers:
+        handler = logging.FileHandler('loss.log', mode='w', encoding='utf-8')
+        # step과 loss 값만 기록하므로, 메시지만 출력하는 간단한 포맷터 사용
+        formatter = logging.Formatter('%(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
 def plot_gantt_chart(schedule_data, n_jobs, n_machines, filename):
     fig, ax = plt.subplots(figsize=(20, 10))
     
@@ -82,65 +97,76 @@ def generate_pre_occupied_schedule(n_machines):
     return schedule
 
 def validate(agent1, agent2, validation_instances, max_ops, current_step):
-    print(f"\n--- [Validation Step {current_step}] Analyzing First Instance ONLY ---")
-
-    # --- 1. 오직 첫 번째 검증 인스턴스만 사용 ---
-    first_instance_data = validation_instances[0]
-    
-    env = FJSPEnv()
-    env.instance_jobs_data = first_instance_data
-    
-    # --- 2. 해당 인스턴스의 자격 테이블을 먼저 생성 ---
-    # reset을 먼저 호출하여 env.jobs 객체를 생성해야 함
-    pre_occupied_schedule = generate_pre_occupied_schedule(env.n_machines)
-    state_dict = env.reset(initial_schedule=pre_occupied_schedule)
-    table_filename = f'validation_eligibility_table_step_{current_step}.png'
-    plot_eligibility_table(env.jobs, table_filename)
-
-    # --- 3. 해당 인스턴스에 대한 시뮬레이션 실행 ---
-    step_in_episode = 0
-    done = False
+    print(f"\n--- [Validation Step {current_step}] ---")
     
     agent1.actor.eval()
     agent2.q_network.eval()
 
+    # --- Part 1: 첫 번째 인스턴스에 대한 상세 분석 및 시각화 ---
+    print("Analyzing the first instance for detailed logs and Gantt chart...")
+    first_instance_data = validation_instances[0]
+    env_detail = FJSPEnv()
+    env_detail.instance_jobs_data = first_instance_data
+    
+    pre_occupied_schedule = generate_pre_occupied_schedule(env_detail.n_machines)
+    state_dict_detail = env_detail.reset(initial_schedule=pre_occupied_schedule)
+    
+    done_detail = False
     with torch.no_grad():
-        while not done:
-            state_data = Data(**state_dict)
+        while not done_detail:
+            state_data = Data(**state_dict_detail)
             op_action, _, _ = agent1.select_action(state_data, deterministic=True)
             
-            # Q-value 및 자격 기계 로그 항상 출력
-            machine_action = agent2.select_action(state_data, op_action, log_q_values=True)
-            
-            # is_validation=True로 설정하여 보상 로그도 reward_log.log에 기록
-            _, _, state_dict, done = env.step((op_action, machine_action), is_validation=True)
-            step_in_episode += 1
+            # --- ▼▼▼ 수정된 부분 ▼▼▼ ---
+            # current_step=current_step 인자를 명시적으로 전달합니다.
+            machine_action = agent2.select_action(state_data, op_action, log_q_values=True, current_step=current_step)
+            _, _, state_dict_detail, done_detail = env_detail.step((op_action, machine_action), is_validation=True, current_step=current_step)
+            # --- ▲▲▲ 수정 끝 ▲▲▲ ---
 
-    final_makespan = env._calculate_makespan()
-    print(f"--- Analysis Complete. Makespan: {final_makespan:.2f} ---")
-    
-    # --- 4. 해당 인스턴스에 대한 간트 차트 생성 ---
+    # 첫 번째 인스턴스에 대한 간트 차트 저장
     schedule_data_for_plot = {}
-    for m in env.machines:
-        # machine 객체마다 빈 리스트를 먼저 할당합니다.
+    for m in env_detail.machines:
         schedule_data_for_plot[m.id] = []
-        # busy_intervals에 모든 정보가 함께 있으므로, 이 리스트만 순회합니다.
         for interval_data in m.busy_intervals:
-            # 튜플에서 모든 정보를 한 번에 언패킹합니다.
             start, end, job_id, op_id = interval_data
-            # 최종 플로팅용 데이터 리스트에 추가합니다.
             schedule_data_for_plot[m.id].append((job_id, op_id, start, end))
     gantt_filename = f'validation_gantt_step_{current_step}.png'
-    plot_gantt_chart(schedule_data_for_plot, env.n_jobs, env.n_machines, gantt_filename)
+    plot_gantt_chart(schedule_data_for_plot, env_detail.n_jobs, env_detail.n_machines, gantt_filename)
+
+    # --- Part 2: 전체 검증 인스턴스에 대한 평균 성능 측정 ---
+    print(f"Running on all {len(validation_instances)} instances for average makespan...")
+    all_makespans = []
+    for instance_data in validation_instances:
+        env_avg = FJSPEnv()
+        env_avg.instance_jobs_data = instance_data
+        pre_occupied_schedule = generate_pre_occupied_schedule(env_avg.n_machines)
+        state_dict_avg = env_avg.reset(initial_schedule=pre_occupied_schedule)
+        
+        done_avg = False
+        with torch.no_grad():
+            while not done_avg:
+                state_data = Data(**state_dict_avg)
+                op_action, _, _ = agent1.select_action(state_data, deterministic=True)
+                # Part 2는 로그를 남기지 않으므로 current_step을 전달할 필요가 없습니다.
+                machine_action = agent2.select_action(state_data, op_action, log_q_values=False)
+                _, _, state_dict_avg, done_avg = env_avg.step((op_action, machine_action), is_validation=False)
+
+        final_makespan = env_avg._calculate_makespan()
+        all_makespans.append(final_makespan)
+
+    average_makespan = np.mean(all_makespans)
+    print(f"--- Validation Complete. Average Makespan: {average_makespan:.2f} ---")
 
     agent1.actor.train()
     agent2.q_network.train()
     
-    # 5. 디버깅 중이므로, 평균이 아닌 단일 인스턴스의 makespan을 반환
-    return final_makespan
+    return average_makespan
 
 def main():
     writer = SummaryWriter()
+    loss_logger = setup_loss_logger()
+    loss_logger.info("step,sac_critic_loss,sac_actor_loss,sac_alpha_loss,d5qn_loss,d5qn_avg_q_value,d5qn_avg_td_error")
+    # --- ▲▲▲ 추가 끝 ▲▲▲ ---
     envs = [FJSPEnv(n_jobs=N_JOBS, n_machines=N_MACHINES) for _ in range(BATCH_SIZE)]
     validation_instances = [FJSPEnv(n_jobs=N_JOBS, n_machines=N_MACHINES).instance_jobs_data for _ in range(100)]
     max_ops_in_dataset = max(sum(len(job_data) for env in envs for job_data in env.instance_jobs_data), MAX_OPS_PER_JOB * N_JOBS)
@@ -202,7 +228,7 @@ def main():
             if sac_loss_dict: log_data['sac'].append(sac_loss_dict)
             if d5qn_loss_dict: log_data['d5qn'].append(d5qn_loss_dict)
 
-        if t % 30 == 0 and t > 0:
+        if t % 500 == 0 and t > 0:
             avg_val_makespan = validate(agent1, agent2, validation_instances, max_ops_in_dataset, t)
             avg_train_makespan = np.mean(episode_makespans) if episode_makespans else 0
             
@@ -224,6 +250,20 @@ def main():
             print(f"\n[Step {t}] Train Makespan: {avg_train_makespan:.2f} | Validation Makespan: {avg_val_makespan:.2f}")
             print(f"  SAC Losses: {avg_sac_losses}")
             print(f"  D5QN Losses: {avg_d5qn_losses}")
+
+           # --- ▼▼▼ [추가됨] 계산된 Loss들을 loss.log 파일에 기록 ▼▼▼ ---
+            if avg_sac_losses and avg_d5qn_losses:
+                sac_critic = avg_sac_losses.get('critic_loss', 'N/A')
+                sac_actor = avg_sac_losses.get('actor_loss', 'N/A')
+                sac_alpha = avg_sac_losses.get('alpha_loss', 'N/A')
+                d5qn_loss = avg_d5qn_losses.get('d5qn_loss', 'N/A')
+                d5qn_q = avg_d5qn_losses.get('avg_q_value', 'N/A')
+                d5qn_td = avg_d5qn_losses.get('avg_td_error', 'N/A')
+                
+                log_msg = (f"{t},{sac_critic:.4f},{sac_actor:.4f},{sac_alpha:.4f},"
+                           f"{d5qn_loss:.4f},{d5qn_q:.4f},{d5qn_td:.4f}")
+                loss_logger.info(log_msg)
+            # --- ▲▲▲ 추가 끝 ▲▲▲ ---
 
             if avg_val_makespan < best_val_makespan:
                 best_val_makespan = avg_val_makespan

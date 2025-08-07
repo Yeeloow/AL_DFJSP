@@ -83,20 +83,18 @@ class Critic(nn.Module):
         return q1, q2
 
 class DuelingD5QN(nn.Module):
+    # [수정됨] machine_feature_dim을 생성자에서 직접 받도록 변경
     def __init__(self, machine_feature_dim, op_machine_pair_dim, hidden_size, n_heads, n_layers):
         super(DuelingD5QN, self).__init__()
         
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=n_heads, batch_first=True, dropout=0.1)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # --- 이 부분이 수정되었습니다 ---
-        # 기계 특징 입력 차원이 2만큼 증가 (earliest_fit_time, num_available_slots)
-        # self.machine_feature_proj = nn.Linear(machine_feature_dim + 2, hidden_size)
-        self.machine_feature_proj = nn.Linear(5, hidden_size)
+        # [수정됨] 입력받은 machine_feature_dim (최종 5차원)을 사용
+        self.machine_feature_proj = nn.Linear(machine_feature_dim, hidden_size)
 
         self.advantage = nn.Sequential(NoisyLinear(hidden_size + op_machine_pair_dim, 128), nn.ReLU(), NoisyLinear(128, 1))
         self.value = nn.Sequential(NoisyLinear(hidden_size + op_machine_pair_dim, 128), nn.ReLU(), NoisyLinear(128, 1))
-
 
     def forward(self, machine_features, op_machine_pairs):
         proj_machine_features = self.machine_feature_proj(machine_features)
