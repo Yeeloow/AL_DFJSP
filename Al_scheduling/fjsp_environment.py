@@ -168,24 +168,35 @@ class FJSPEnv:
                     job.completion_rate, total_completion_rate_op, total_completion_rate_job
                 ])
 
-        # Agent2가 사용할 기본 Machine feature 계산
+        # --- [수정] 새로운 특징 계산에 필요한 원본 데이터를 여기서 미리 계산합니다. ---
+        
+        # 1. '장비별 작업 완료율' 계산을 위한 데이터
+        total_potential_ops_per_machine = [0] * self.n_machines
+        completed_ops_per_machine = [0] * self.n_machines
+        for job in self.jobs:
+            for op in job.ops:
+                for m_id in op.eligible_machines:
+                    total_potential_ops_per_machine[m_id] += 1
+                    if op.is_scheduled:
+                        completed_ops_per_machine[m_id] += 1
+        
+        # 2. '장비 가용 시간' 계산을 위한 데이터
+        machine_availability_times = [m.available_time for m in self.machines]
+        
+        # 3. 기존 machine_features (후보 공정 수 계산) -> 이 정보는 이제 사용하지 않음
         machine_features_list = []
         for m_idx, machine in enumerate(self.machines):
             num_candidates = sum(
                 1 for op_g_idx in eligible_ops_indices
                 if m_idx in self.jobs[self.op_map_rev[op_g_idx][0]].ops[self.op_map_rev[op_g_idx][1]].eligible_machines
             )
-            workload = machine.workload
-            machine_features_list.append([workload, float(num_candidates)])
+            # workload 대신 num_candidates만 사용 (이마저도 새 특징 벡터에서는 사용 안 함)
+            machine_features_list.append([0.0, float(num_candidates)])
 
-        op_machine_pairs_features_list = [[([0.0, 0.0]) for _ in range(self.n_machines)] for _ in range(self.total_ops)]
-        if self.total_ops > 0:
-            for op_g_idx in range(self.total_ops):
-                job_id, op_id = self.op_map_rev[op_g_idx]
-                job, op = self.jobs[job_id], job.ops[op_id]
-                for m_idx, proc_time in op.machine_map.items():
-                    ratio = proc_time / (job.remaining_workload + 1e-8)
-                    op_machine_pairs_features_list[op_g_idx][m_idx] = [proc_time, ratio]
+        # om_features는 구조만 유지 (에이전트에서 직접 사용하지는 않음) + 초기화 버그 수정
+        op_machine_pairs_features_list = [[[0.0, 0.0] for _ in range(self.n_machines)] for _ in range(self.total_ops)]
+        
+        # --- 수정 끝 ---
 
         edge_index_list = []
         for job in self.jobs:
@@ -200,7 +211,6 @@ class FJSPEnv:
                 if u_global_idx is not None and v_global_idx is not None:
                     edge_index_list.append([u_global_idx, v_global_idx])
 
-        # [수정됨] Agent2가 실시간 특징 계산에 필요한 모든 정보를 반환
         return {
             'x': torch.tensor(op_features_list, dtype=torch.float) if op_features_list else torch.empty((0, 10)),
             'edge_index': torch.tensor(edge_index_list, dtype=torch.long).t().contiguous() if edge_index_list else torch.empty((2, 0), dtype=torch.long),
@@ -212,7 +222,11 @@ class FJSPEnv:
             'op_map_rev': self.op_map_rev,
             'op_histories': [m.busy_intervals for m in self.machines],
             'travel_times': torch.tensor(self.travel_times, dtype=torch.float),
-            'jobs': copy.deepcopy(self.jobs) # Agent가 수정하지 못하도록 deepcopy
+            'jobs': copy.deepcopy(self.jobs),
+            # [추가] 새로 계산한 데이터를 state에 포함하여 에이전트에 전달
+            'machine_availability_times': torch.tensor(machine_availability_times, dtype=torch.float),
+            'total_potential_ops_per_machine': torch.tensor(total_potential_ops_per_machine, dtype=torch.float),
+            'completed_ops_per_machine': torch.tensor(completed_ops_per_machine, dtype=torch.float),
         }
 
     def step(self, action, is_validation=False, current_step=None):
@@ -265,8 +279,9 @@ class FJSPEnv:
         # is_validation일 때 모든 상세 정보와 보상 정보를 파일에 기록
         if is_validation:
             # --- ▼▼▼ 수정된 부분 (로그 메시지 형식 변경) ▼▼▼ ---
+            # f-string의 {current_step} 부분을 'None'으로 직접 변경
             log_message = (
-                f"\n[Step {current_step} | J{job_id}-O{op_id} on M{machine_idx}]\n"
+                f"\n[Step None | J{job_id}-O{op_id} on M{machine_idx}]\n"
                 f"  - Predecessor Info: Comp_Time={prev_op_comp_time}, Travel_Time={travel_time} -> Ready_Time={ready_time}\n"
                 f"  - Machine Schedule Before: {busy_intervals_before}\n"
                 f"  - Decision: Proc_Time={processing_time}, Actual_Start={start_time}, Comp_Time={completion_time}\n"
